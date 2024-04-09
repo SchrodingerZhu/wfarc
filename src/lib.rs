@@ -34,6 +34,7 @@ pub struct Arc<T: ?Sized, A: Allocator = Global> {
 }
 
 impl<T: ?Sized> ArcInner<T> {
+    #[inline]
     unsafe fn release_weak<A: Allocator>(this: NonNull<Self>, alloc: A) {
         // it is ok to use relaxed ordering since we are to do fetch_sub later on
         let old = this.as_ref().weak.load(Ordering::Relaxed);
@@ -41,6 +42,7 @@ impl<T: ?Sized> ArcInner<T> {
             Box::from_raw_in(this.as_ptr(), alloc);
         }
     }
+    #[inline]
     unsafe fn release_strong<A: Allocator>(mut this: NonNull<Self>, alloc: A) {
         let old = this.as_ref().strong.fetch_sub(RC_SINGLE, Ordering::Relaxed);
         if old > RC_SINGLE + WEAK {
@@ -66,6 +68,7 @@ impl<T: ?Sized> ArcInner<T> {
         // Release the implicitly held weak reference
         Self::release_weak(this, alloc);
     }
+    #[inline]
     unsafe fn acquire_weak(this: NonNull<Self>) {
         // it is ok to use relaxed ordering since we are to do compare_exchange later on
         let old = this.as_ref().weak.load(Ordering::Relaxed);
@@ -87,18 +90,21 @@ impl<T: ?Sized> ArcInner<T> {
             core::intrinsics::abort();
         }
     }
+    #[inline]
     unsafe fn acquire_strong(this: NonNull<Self>) {
         let val = this.as_ref().strong.fetch_add(RC_SINGLE, Ordering::Relaxed);
         if core::intrinsics::unlikely((val >> 2) > MAX_STRONG_COUNT) {
             core::intrinsics::abort();
         }
     }
+    #[inline]
     unsafe fn acquire_strong_from_weak(this: NonNull<Self>) -> bool {
         let old = this.as_ref().strong.fetch_add(RC_SINGLE, Ordering::Relaxed);
         if old & CLOSED != 0 {
             return false;
         }
         if old < RC_SINGLE {
+            // only one implicit weak reference
             Self::acquire_weak(this);
         }
         true
