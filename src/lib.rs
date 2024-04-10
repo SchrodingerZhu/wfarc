@@ -36,15 +36,14 @@ pub struct Arc<T: ?Sized, A: Allocator = Global> {
 impl<T: ?Sized> ArcInner<T> {
     #[inline]
     unsafe fn release_weak<A: Allocator>(this: NonNull<Self>, alloc: A) {
-        // it is ok to use relaxed ordering since we are to do fetch_sub later on
-        let old = this.as_ref().weak.load(Ordering::Relaxed);
+        let old = this.as_ref().weak.load(Ordering::Acquire);
         if old == 1 || this.as_ref().weak.fetch_sub(1, Ordering::AcqRel) == 0 {
             Box::from_raw_in(this.as_ptr(), alloc);
         }
     }
     #[inline]
     unsafe fn release_strong<A: Allocator>(mut this: NonNull<Self>, alloc: A) {
-        let old = this.as_ref().strong.fetch_sub(RC_SINGLE, Ordering::Relaxed);
+        let old = this.as_ref().strong.fetch_sub(RC_SINGLE, Ordering::Acquire);
         if old > RC_SINGLE + WEAK {
             // object is still alive, return
             return;
