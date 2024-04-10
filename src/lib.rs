@@ -10,8 +10,11 @@ const MAX_STRONG_COUNT: usize = isize::MAX as usize >> 2; // 61 bits for strong 
 const MAX_WEAK_COUNT: usize = isize::MAX as usize; // 63 bits for weak count
 
 use core::{
-    alloc::{Allocator, Layout},
+    alloc::Allocator,
     marker::PhantomData,
+    mem::MaybeUninit,
+    ops::Deref,
+    panic::{RefUnwindSafe, UnwindSafe},
     ptr::NonNull,
     sync::atomic::{AtomicUsize, Ordering},
 };
@@ -27,10 +30,152 @@ struct ArcInner<T: ?Sized> {
 unsafe impl<T: ?Sized + Sync + Send> Send for ArcInner<T> {}
 unsafe impl<T: ?Sized + Sync + Send> Sync for ArcInner<T> {}
 
+struct AllocHolder<A: Allocator>(MaybeUninit<A>);
+
+impl<A: Allocator> AllocHolder<A> {
+    fn new(alloc: A) -> Self {
+        Self(MaybeUninit::new(alloc))
+    }
+    #[inline]
+    unsafe fn clone(this: &Self) -> Self
+    where
+        A: Clone,
+    {
+        Self::new(this.0.assume_init_ref().clone())
+    }
+    #[inline]
+    unsafe fn take(this: &mut Self) -> A {
+        this.0.assume_init_read()
+    }
+}
+
 pub struct Arc<T: ?Sized, A: Allocator = Global> {
     ptr: NonNull<ArcInner<T>>,
     phantom: PhantomData<ArcInner<T>>,
-    alloc: A,
+    alloc: AllocHolder<A>,
+}
+
+pub struct Weak<T: ?Sized, A: Allocator = Global> {
+    ptr: NonNull<ArcInner<T>>,
+    alloc: AllocHolder<A>,
+}
+
+impl<T> Arc<T> {
+    pub fn new(data: T) -> Self {
+        Self::new_in(data, Global)
+    }
+}
+
+impl<T, A: Allocator> Arc<T, A> {
+    pub fn new_in(data: T, alloc: A) -> Self {
+        let boxed = Box::new_in(
+            ArcInner {
+                strong: AtomicUsize::new(RC_SINGLE),
+                weak: AtomicUsize::new(0),
+                data,
+            },
+            alloc,
+        );
+        let (ptr, alloc) = Box::into_raw_with_allocator(boxed);
+        let ptr = unsafe { NonNull::new_unchecked(ptr) };
+        let alloc = AllocHolder::new(alloc);
+        Self {
+            ptr,
+            phantom: PhantomData,
+            alloc,
+        }
+    }
+}
+
+impl<T: ?Sized, A: Allocator> Arc<T, A> {
+    pub fn downgrade(this: &Self) -> Weak<T, A>
+    where
+        A: Clone,
+    {
+        unsafe {
+            ArcInner::acquire_weak(this.ptr);
+            Weak {
+                ptr: this.ptr,
+                alloc: AllocHolder::clone(&this.alloc),
+            }
+        }
+    }
+    fn inner(&self) -> &ArcInner<T> {
+        unsafe { self.ptr.as_ref() }
+    }
+}
+
+impl<T: ?Sized, A: Allocator> Weak<T, A> {
+    pub fn upgrade(this: &Self) -> Option<Arc<T, A>>
+    where
+        A: Clone,
+    {
+        unsafe {
+            if ArcInner::acquire_strong_from_weak(this.ptr) {
+                Some(Arc {
+                    ptr: this.ptr,
+                    phantom: PhantomData,
+                    alloc: AllocHolder::clone(&this.alloc),
+                })
+            } else {
+                None
+            }
+        }
+    }
+}
+
+impl<T: ?Sized, A: Allocator> Drop for Arc<T, A> {
+    fn drop(&mut self) {
+        unsafe { ArcInner::release_strong(self.ptr, AllocHolder::take(&mut self.alloc)) };
+    }
+}
+
+impl<T: ?Sized, A: Allocator> Drop for Weak<T, A> {
+    fn drop(&mut self) {
+        unsafe { ArcInner::release_weak(self.ptr, AllocHolder::take(&mut self.alloc)) };
+    }
+}
+
+impl<T: ?Sized, A: Allocator + Clone> Clone for Weak<T, A> {
+    fn clone(&self) -> Self {
+        unsafe {
+            ArcInner::acquire_weak(self.ptr);
+            Weak {
+                ptr: self.ptr,
+                alloc: AllocHolder::clone(&self.alloc),
+            }
+        }
+    }
+}
+
+impl<T: ?Sized, A: Allocator + Clone> Clone for Arc<T, A> {
+    fn clone(&self) -> Self {
+        unsafe {
+            ArcInner::acquire_strong(self.ptr);
+            Arc {
+                ptr: self.ptr,
+                phantom: PhantomData,
+                alloc: AllocHolder::clone(&self.alloc),
+            }
+        }
+    }
+}
+
+unsafe impl<T: ?Sized + Sync + Send, A: Allocator + Send> Send for Arc<T, A> {}
+unsafe impl<T: ?Sized + Sync + Send, A: Allocator + Sync> Sync for Arc<T, A> {}
+
+unsafe impl<T: ?Sized + Sync + Send, A: Allocator + Send> Send for Weak<T, A> {}
+unsafe impl<T: ?Sized + Sync + Send, A: Allocator + Sync> Sync for Weak<T, A> {}
+
+impl<T: RefUnwindSafe + ?Sized, A: Allocator + UnwindSafe> UnwindSafe for Arc<T, A> {}
+
+impl<T: ?Sized, A: Allocator> Deref for Arc<T, A> {
+    type Target = T;
+
+    #[inline]
+    fn deref(&self) -> &T {
+        &self.inner().data
+    }
 }
 
 impl<T: ?Sized> ArcInner<T> {
