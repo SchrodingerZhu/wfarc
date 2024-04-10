@@ -106,16 +106,16 @@ impl<T: ?Sized, A: Allocator> Arc<T, A> {
 }
 
 impl<T: ?Sized, A: Allocator> Weak<T, A> {
-    pub fn upgrade(this: &Self) -> Option<Arc<T, A>>
+    pub fn upgrade(&self) -> Option<Arc<T, A>>
     where
         A: Clone,
     {
         unsafe {
-            if ArcInner::acquire_strong_from_weak(this.ptr) {
+            if ArcInner::acquire_strong_from_weak(self.ptr) {
                 Some(Arc {
-                    ptr: this.ptr,
+                    ptr: self.ptr,
                     phantom: PhantomData,
-                    alloc: AllocHolder::clone(&this.alloc),
+                    alloc: AllocHolder::clone(&self.alloc),
                 })
             } else {
                 None
@@ -252,5 +252,18 @@ impl<T: ?Sized> ArcInner<T> {
             Self::acquire_weak(this);
         }
         true
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use super::*;
+    #[test]
+    fn basic() {
+        let arc = Arc::new(42);
+        let weak = Arc::downgrade(&arc);
+        assert!(weak.upgrade().is_some());
+        drop(arc);
+        assert!(weak.upgrade().is_none());
     }
 }
