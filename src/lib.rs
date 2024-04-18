@@ -9,10 +9,13 @@ const CLOSED: usize = 1;
 const MAX_STRONG_COUNT: usize = isize::MAX as usize >> 2; // 61 bits for strong count
 const MAX_WEAK_COUNT: usize = isize::MAX as usize; // 63 bits for weak count
 
+#[cfg(test)]
+mod tests;
+
 use core::{
     alloc::Allocator,
     marker::PhantomData,
-    mem::MaybeUninit,
+    mem::{ManuallyDrop, MaybeUninit},
     ops::Deref,
     panic::{RefUnwindSafe, UnwindSafe},
     ptr::NonNull,
@@ -24,7 +27,7 @@ use alloc::{alloc::Global, boxed::Box};
 struct ArcInner<T: ?Sized> {
     strong: AtomicUsize,
     weak: AtomicUsize,
-    data: T,
+    data: ManuallyDrop<T>,
 }
 
 unsafe impl<T: ?Sized + Sync + Send> Send for ArcInner<T> {}
@@ -72,7 +75,7 @@ impl<T, A: Allocator> Arc<T, A> {
             ArcInner {
                 strong: AtomicUsize::new(RC_SINGLE),
                 weak: AtomicUsize::new(0),
-                data,
+                data: ManuallyDrop::new(data),
             },
             alloc,
         );
@@ -102,6 +105,12 @@ impl<T: ?Sized, A: Allocator> Arc<T, A> {
     }
     fn inner(&self) -> &ArcInner<T> {
         unsafe { self.ptr.as_ref() }
+    }
+    pub fn strong_count(&self) -> usize {
+        self.inner().strong.load(Ordering::Acquire) >> 2
+    }
+    pub fn weak_count(&self) -> usize {
+        self.inner().weak.load(Ordering::Acquire)
     }
 }
 
@@ -188,7 +197,7 @@ impl<T: ?Sized> ArcInner<T> {
     }
     #[inline]
     unsafe fn release_strong<A: Allocator>(mut this: NonNull<Self>, alloc: A) {
-        let old = this.as_ref().strong.fetch_sub(RC_SINGLE, Ordering::Acquire);
+        let old = this.as_ref().strong.fetch_sub(RC_SINGLE, Ordering::AcqRel);
         if old > RC_SINGLE + WEAK {
             // object is still alive, return
             return;
@@ -196,7 +205,7 @@ impl<T: ?Sized> ArcInner<T> {
         if old & WEAK == 0 {
             // this RC has never been weakly referenced
             // drop it immediately
-            core::ptr::drop_in_place(&mut this.as_mut().data);
+            ManuallyDrop::drop(&mut this.as_mut().data);
             Box::from_raw_in(this.as_ptr(), alloc);
             return;
         }
@@ -207,7 +216,7 @@ impl<T: ?Sized> ArcInner<T> {
             .is_ok()
         {
             // Previous CAS successfully closed the object. Thus, it is our responsibility to drop the associated data.
-            core::ptr::drop_in_place(&mut this.as_mut().data);
+            ManuallyDrop::drop(&mut this.as_mut().data);
         }
         // Release the implicitly held weak reference
         Self::release_weak(this, alloc);
@@ -252,18 +261,5 @@ impl<T: ?Sized> ArcInner<T> {
             Self::acquire_weak(this);
         }
         true
-    }
-}
-
-#[cfg(test)]
-mod test {
-    use super::*;
-    #[test]
-    fn basic() {
-        let arc = Arc::new(42);
-        let weak = Arc::downgrade(&arc);
-        assert!(weak.upgrade().is_some());
-        drop(arc);
-        assert!(weak.upgrade().is_none());
     }
 }
